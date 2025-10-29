@@ -18,7 +18,7 @@
 # Usage (Manual Mode):
 #   ./mfa-share.sh <MFA_TOKEN> <ACCOUNT_ID> <ROLE_NAME>
 #
-# Credentials are stored in ~/.aws/credentials as 'aws-temp' profile
+# Credentials are stored in ~/.aws/credentials as 'temp-<profile_name>' profile
 #
 # Version: 3.0
 ################################################################################
@@ -36,11 +36,11 @@ readonly DEFAULT_REGION="us-east-1"
 readonly SESSION_DURATION=21600  # 6 hours
 readonly MIN_SESSION_DURATION=900  # 15 minutes
 readonly MAX_SESSION_DURATION=43200  # 12 hours
-readonly OUTPUT_PROFILE_NAME="aws-temp"
 readonly MAX_PROFILE_DISPLAY=15
 
 # Default paths (can be overridden with options)
 AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+DEFAULT_1PASSWORD_ITEM="${DEFAULT_1PASSWORD_ITEM:-}"
 
 ################################################################################
 # COLOR CODES FOR OUTPUT
@@ -78,6 +78,9 @@ USE_PROFILE=""
 PROFILE_ACCOUNT_ID=""
 PROFILE_ROLE=""
 PROFILE_REGION=""
+USE_1PASSWORD=false
+ONEPASSWORD_ITEM=""
+OUTPUT_PROFILE_NAME=""
 
 ################################################################################
 # UTILITY FUNCTIONS
@@ -302,10 +305,93 @@ select_profile_interactive() {
     echo -e "${GREEN}Selected profile:${NC} ${CYAN}${profile_name}${NC}"
     echo -e ""
 
-    read -p "Enter your 6-digit MFA code from authenticator app: " mfa_code
+    # Check if 1Password CLI is available
+    if command -v op &> /dev/null; then
+        local mfa_options=("Fetch from 1Password" "Enter manually from authenticator app")
+        local mfa_selected=1
 
-    if [[ -n "${mfa_code}" ]]; then
-        exec "${BASH_SOURCE[0]}" --profile "${profile_name}" "${mfa_code}"
+        # Function to display MFA method menu
+        display_mfa_menu() {
+            clear
+            echo -e "${GREEN}Selected profile:${NC} ${CYAN}${profile_name}${NC}"
+            echo -e ""
+            echo -e "${CYAN}How would you like to provide your MFA code?${NC}"
+            echo -e ""
+            echo -e "Use ${YELLOW}↑/↓${NC} arrow keys to navigate, ${YELLOW}Enter${NC} to select:"
+            echo -e ""
+
+            for i in "${!mfa_options[@]}"; do
+                local num=$((i + 1))
+                if [[ $((i + 1)) -eq $mfa_selected ]]; then
+                    echo -e "  ${MAGENTA}▶${NC} ${GREEN}${mfa_options[$i]}${NC}"
+                else
+                    echo -e "    ${BLUE}${mfa_options[$i]}${NC}"
+                fi
+            done
+            echo -e ""
+        }
+
+        # Arrow key navigation loop
+        while true; do
+            display_mfa_menu
+
+            read -rsn1 key
+
+            if [[ $key == $'\x1b' ]]; then
+                read -rsn2 key
+                case "$key" in
+                    '[A') # Up arrow
+                        ((mfa_selected--))
+                        if [[ $mfa_selected -lt 1 ]]; then
+                            mfa_selected=${#mfa_options[@]}
+                        fi
+                        ;;
+                    '[B') # Down arrow
+                        ((mfa_selected++))
+                        if [[ $mfa_selected -gt ${#mfa_options[@]} ]]; then
+                            mfa_selected=1
+                        fi
+                        ;;
+                esac
+            elif [[ $key == "" ]]; then
+                # Enter key pressed
+                break
+            fi
+        done
+
+        clear
+        echo -e "${GREEN}Selected profile:${NC} ${CYAN}${profile_name}${NC}"
+        echo -e ""
+
+        if [[ $mfa_selected -eq 1 ]]; then
+            # Fetch from 1Password
+            local default_prompt="Enter 1Password item name"
+            if [[ -n "${DEFAULT_1PASSWORD_ITEM}" ]]; then
+                default_prompt="Enter 1Password item name [${DEFAULT_1PASSWORD_ITEM}]"
+            fi
+            read -p "${default_prompt}: " op_item
+
+            # Use default if no input provided
+            if [[ -z "${op_item}" && -n "${DEFAULT_1PASSWORD_ITEM}" ]]; then
+                op_item="${DEFAULT_1PASSWORD_ITEM}"
+            fi
+
+            if [[ -n "${op_item}" ]]; then
+                exec "${BASH_SOURCE[0]}" --profile "${profile_name}" --use-1password "${op_item}"
+            fi
+        else
+            # Manual entry
+            read -p "Enter your 6-digit MFA code from authenticator app: " mfa_code
+            if [[ -n "${mfa_code}" ]]; then
+                exec "${BASH_SOURCE[0]}" --profile "${profile_name}" "${mfa_code}"
+            fi
+        fi
+    else
+        # 1Password CLI not available, only manual entry
+        read -p "Enter your 6-digit MFA code from authenticator app: " mfa_code
+        if [[ -n "${mfa_code}" ]]; then
+            exec "${BASH_SOURCE[0]}" --profile "${profile_name}" "${mfa_code}"
+        fi
     fi
 }
 
@@ -314,9 +400,11 @@ show_help() {
     echo ""
     echo -e "${BLUE}Usage (Profile Mode):${NC}"
     echo "    ${SCRIPT_NAME} --profile <PROFILE_NAME> <MFA_TOKEN> [OPTIONS]"
+    echo "    ${SCRIPT_NAME} --profile <PROFILE_NAME> --use-1password <ITEM_NAME> [OPTIONS]"
     echo ""
     echo -e "${BLUE}Usage (Manual Mode):${NC}"
     echo "    ${SCRIPT_NAME} <MFA_TOKEN> <ACCOUNT_ID> <ROLE_NAME> [OPTIONS]"
+    echo "    ${SCRIPT_NAME} --use-1password <ITEM_NAME> <ACCOUNT_ID> <ROLE_NAME> [OPTIONS]"
     echo ""
     echo -e "${BLUE}Arguments:${NC}"
     echo "    MFA_TOKEN              6-digit code from authenticator app"
@@ -325,9 +413,11 @@ show_help() {
     echo "    PROFILE_NAME           AWS config profile name (extracts account, role, region)"
     echo "    ACCOUNT_ID             12-digit AWS account ID"
     echo "    ROLE_NAME              IAM role to assume (required)"
+    echo "    ITEM_NAME              1Password item name containing the TOTP/OTP code"
     echo ""
     echo -e "${BLUE}Options:${NC}"
     echo "    --profile NAME         Use AWS config profile (recommended)"
+    echo "    --use-1password ITEM   Fetch MFA code from 1Password CLI"
     echo "    -h, --help             Show this help message"
     echo "    -v, --verbose          Enable verbose output"
     echo "    -p, --list-profiles    List available AWS config profiles"
@@ -336,9 +426,10 @@ show_help() {
     echo "    -a, --aws-config FILE  Use custom AWS config file (default: ~/.aws/config)"
     echo ""
     echo -e "${BLUE}Environment Variables:${NC}"
-    echo "    AWS_CONFIG_FILE        Override AWS config file location"
-    echo "    AWS_MFA_SERIAL         Override auto-detected MFA serial number"
-    echo "    AWS_REGION             Set AWS region (default: ${DEFAULT_REGION})"
+    echo "    AWS_CONFIG_FILE            Override AWS config file location"
+    echo "    AWS_MFA_SERIAL             Override auto-detected MFA serial number"
+    echo "    AWS_REGION                 Set AWS region (default: ${DEFAULT_REGION})"
+    echo "    DEFAULT_1PASSWORD_ITEM     Default 1Password item name (interactive mode)"
     echo ""
     echo -e "${BLUE}Examples (Profile Mode - Recommended):${NC}"
     echo "    # List available profiles"
@@ -346,6 +437,9 @@ show_help() {
     echo ""
     echo "    # Use profile (extracts account, role, region automatically)"
     echo "    ${SCRIPT_NAME} --profile production 123456"
+    echo ""
+    echo "    # Use profile with 1Password (no manual code entry needed)"
+    echo "    ${SCRIPT_NAME} --profile production --use-1password 'AWS'"
     echo ""
     echo "    # Profile with custom duration (12 hours)"
     echo "    ${SCRIPT_NAME} --profile staging 123456 -t ${MAX_SESSION_DURATION}"
@@ -357,8 +451,8 @@ show_help() {
     echo "    # Basic usage with account ID and role"
     echo "    ${SCRIPT_NAME} 123456 123456789012 AdminRole"
     echo ""
-    echo "    # Different role"
-    echo "    ${SCRIPT_NAME} 123456 123456789012 ReadOnlyAccess"
+    echo "    # With 1Password integration"
+    echo "    ${SCRIPT_NAME} --use-1password 'AWS' 123456789012 AdminRole"
     echo ""
     echo "    # Verbose mode"
     echo "    ${SCRIPT_NAME} -v 123456 987654321098 DeveloperRole"
@@ -367,6 +461,15 @@ show_help() {
     echo "    - AWS CLI v2+ installed and configured"
     echo "    - jq (JSON processor)"
     echo "    - MFA device configured in ~/.aws/config"
+    echo "    - 1Password CLI (optional, for --use-1password flag)"
+    echo ""
+    echo -e "${BLUE}1Password Setup:${NC}"
+    echo "    1. Install 1Password CLI: brew install --cask 1password-cli"
+    echo "    2. Sign in: eval \$(op signin)"
+    echo "    3. Ensure your AWS item has a TOTP/OTP field configured"
+    echo "    4. Find item name: op item list"
+    echo "    5. (Optional) Set default item: export DEFAULT_1PASSWORD_ITEM='AWS'"
+    echo "       Add to ~/.bashrc or ~/.zshrc to make permanent"
     echo ""
     echo -e "${BLUE}Profile Configuration:${NC}"
     echo "    Profile mode reads from ~/.aws/config"
@@ -376,8 +479,8 @@ show_help() {
     echo "      - source_profile (optional) - base profile with credentials"
     echo ""
     echo -e "${BLUE}Output:${NC}"
-    echo "    Credentials are written to ~/.aws/credentials as profile 'aws-temp'"
-    echo "    Use: export AWS_PROFILE=aws-temp"
+    echo "    Credentials are written to ~/.aws/credentials as profile 'temp-<profile_name>'"
+    echo "    Example: export AWS_PROFILE=temp-production"
     echo ""
 }
 
@@ -392,9 +495,19 @@ check_dependencies() {
         missing_deps+=("jq")
     fi
 
+    # Check for 1Password CLI only if --use-1password is specified
+    if [[ "${USE_1PASSWORD}" == true ]] && ! command -v op &> /dev/null; then
+        missing_deps+=("1password-cli")
+    fi
+
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         log_error "Missing required dependencies: ${missing_deps[*]}"
-        log_info "Install with: brew install ${missing_deps[*]}"
+        if [[ " ${missing_deps[*]} " =~ " 1password-cli " ]]; then
+            log_info "Install 1Password CLI: brew install --cask 1password-cli"
+            log_info "Install other tools: brew install ${missing_deps[*]//1password-cli/}"
+        else
+            log_info "Install with: brew install ${missing_deps[*]}"
+        fi
         return 1
     fi
 
@@ -507,6 +620,56 @@ get_profile_info() {
 }
 
 ################################################################################
+# 1PASSWORD INTEGRATION FUNCTIONS
+################################################################################
+
+# Fetch MFA code from 1Password
+get_mfa_from_1password() {
+    local item_name="$1"
+
+    log_verbose "Fetching MFA code from 1Password item: ${item_name}"
+
+    # Check if 1Password CLI is available
+    if ! command -v op &> /dev/null; then
+        log_error "1Password CLI (op) not found"
+        log_info "Install with: brew install --cask 1password-cli"
+        return 1
+    fi
+
+    # Fetch the TOTP code from 1Password
+    local mfa_code
+    if ! mfa_code=$(op item get "${item_name}" --otp 2>&1); then
+        log_error "Failed to retrieve MFA code from 1Password"
+
+        if [[ "${mfa_code}" == *"isn't a valid item"* ]] || [[ "${mfa_code}" == *"not found"* ]]; then
+            log_info "Item '${item_name}' not found in 1Password"
+            log_info "Use 'op item list' to see available items"
+        elif [[ "${mfa_code}" == *"not currently signed in"* ]]; then
+            log_info "Not signed in to 1Password CLI"
+            log_info "Run: eval \$(op signin)"
+        elif [[ "${mfa_code}" == *"no one-time password"* ]]; then
+            log_info "Item '${item_name}' does not have a one-time password field"
+            log_info "Make sure the item has a TOTP/OTP field configured"
+        else
+            log_verbose "1Password error: ${mfa_code}"
+        fi
+
+        return 1
+    fi
+
+    # Validate the MFA code format
+    if ! [[ "${mfa_code}" =~ ^[0-9]{6}$ ]]; then
+        log_error "Invalid MFA code format from 1Password: '${mfa_code}'"
+        log_info "Expected 6-digit code"
+        return 1
+    fi
+
+    log_verbose "Successfully retrieved MFA code from 1Password"
+    echo "${mfa_code}"
+    return 0
+}
+
+################################################################################
 # MFA DETECTION FUNCTIONS
 ################################################################################
 
@@ -557,6 +720,81 @@ detect_mfa_serial() {
 ################################################################################
 # AWS ASSUME ROLE FUNCTIONS
 ################################################################################
+
+fetch_mfa_token_if_needed() {
+    # If we're using 1Password and MFA_TOKEN is empty, fetch it now
+    if [[ "${USE_1PASSWORD}" == true && -z "${MFA_TOKEN}" ]]; then
+        log_info "Fetching MFA code from 1Password..."
+        local fetched_token
+        if ! fetched_token=$(get_mfa_from_1password "${ONEPASSWORD_ITEM}"); then
+            return 1
+        fi
+        MFA_TOKEN="${fetched_token}"
+        log_success "MFA code retrieved from 1Password"
+        log_verbose "MFA Token: ${MFA_TOKEN}"
+    fi
+    return 0
+}
+
+check_credentials_validity() {
+    local target_account_id="$1"
+    local target_role_name="$2"
+    
+    log_verbose "Checking if current credentials are still valid"
+    
+    # Check if we have existing credentials for the temp profile
+    local credentials_file="${HOME}/.aws/credentials"
+    local profile_name="${OUTPUT_PROFILE_NAME}"
+    
+    if [[ ! -f "${credentials_file}" ]]; then
+        log_verbose "No credentials file found"
+        return 1
+    fi
+    
+    # Check if the profile exists in credentials file
+    if ! grep -q "^\[${profile_name}\]" "${credentials_file}" 2>/dev/null; then
+        log_verbose "Profile '${profile_name}' not found in credentials file"
+        return 1
+    fi
+    
+    # Test the credentials by calling AWS STS with the temp profile
+    local temp_profile_export="AWS_PROFILE=${profile_name}"
+    local identity_output
+    
+    if ! identity_output=$(AWS_PROFILE="${profile_name}" aws sts get-caller-identity 2>/dev/null); then
+        log_verbose "Current credentials are invalid or expired"
+        return 1
+    fi
+    
+    # Parse the current identity
+    local current_account current_role
+    current_account=$(echo "${identity_output}" | jq -r '.Account // empty' 2>/dev/null)
+    local current_arn=$(echo "${identity_output}" | jq -r '.Arn // empty' 2>/dev/null)
+    
+    if [[ -z "${current_account}" || -z "${current_arn}" ]]; then
+        log_verbose "Could not parse current identity"
+        return 1
+    fi
+    
+    # Extract role name from ARN (format: arn:aws:sts::ACCOUNT:assumed-role/ROLE_NAME/SESSION_NAME)
+    if [[ "${current_arn}" =~ arn:aws:sts::[0-9]+:assumed-role/([^/]+)/ ]]; then
+        current_role="${BASH_REMATCH[1]}"
+    else
+        log_verbose "Could not extract role name from ARN: ${current_arn}"
+        return 1
+    fi
+    
+    # Check if we're already in the correct account and role
+    if [[ "${current_account}" == "${target_account_id}" && "${current_role}" == "${target_role_name}" ]]; then
+        log_success "Current credentials are valid for account ${target_account_id} and role ${target_role_name}"
+        log_info "No need to assume role again"
+        return 0
+    else
+        log_verbose "Current credentials are for account ${current_account}, role ${current_role}"
+        log_verbose "Target is account ${target_account_id}, role ${target_role_name}"
+        return 1
+    fi
+}
 
 assume_role_with_mfa() {
     local mfa_token="$1"
@@ -690,7 +928,7 @@ assume_role_with_mfa() {
 ################################################################################
 
 write_credentials_to_profile() {
-    local profile_name="${OUTPUT_PROFILE_NAME}"
+    local profile_name="$1"
     local credentials_file="${HOME}/.aws/credentials"
     local credentials_dir="${HOME}/.aws"
 
@@ -776,10 +1014,16 @@ EOF
         else
             log_error "Failed to update credentials file and create backup"
         fi
+        # Clean up temp file before returning
+        rm -f "${temp_file}"
+        trap - EXIT  # Clear the trap
         return 1
     fi
 
     chmod 600 "${credentials_file}"
+    
+    # Clear the trap since we successfully moved the temp file
+    trap - EXIT
 
     log_success "Credentials written to profile '${profile_name}' in ${credentials_file}"
     return 0
@@ -848,6 +1092,15 @@ parse_arguments() {
                 SESSION_DURATION_OVERRIDE="$2"
                 shift 2
                 ;;
+            --use-1password)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option --use-1password requires an argument (1Password item name)"
+                    exit 1
+                fi
+                USE_1PASSWORD=true
+                ONEPASSWORD_ITEM="$2"
+                shift 2
+                ;;
             -*)
                 log_error "Unknown option: $1"
                 show_help
@@ -861,26 +1114,15 @@ parse_arguments() {
     done
 
     # Restore positional arguments
-    set -- "${positional_args[@]}"
+    if [[ ${#positional_args[@]} -gt 0 ]]; then
+        set -- "${positional_args[@]}"
+    else
+        set --
+    fi
 
-    # When using --profile, only MFA token is required
+    # When using --profile, extract profile information but delay MFA token fetching
     if [[ -n "${USE_PROFILE}" ]]; then
-        if [[ $# -lt 1 ]]; then
-            log_error "Missing required argument: MFA_TOKEN"
-            echo ""
-            show_help
-            exit 1
-        fi
-
-        readonly MFA_TOKEN="$1"
-
-        # Validate MFA token format
-        if ! [[ "${MFA_TOKEN}" =~ ^[0-9]{6}$ ]]; then
-            log_error "Invalid MFA token format. Expected 6 digits, got: '${MFA_TOKEN}'"
-            exit 1
-        fi
-
-        # Extract profile information
+        # Extract profile information first
         if ! get_profile_info "${USE_PROFILE}"; then
             exit 1
         fi
@@ -888,8 +1130,28 @@ parse_arguments() {
         readonly ACCOUNT_INPUT="${PROFILE_ACCOUNT_ID}"
         readonly ROLE_NAME="${PROFILE_ROLE}"
 
+        # Store arguments for later MFA token fetching (only if needed)
+        if [[ "${USE_1PASSWORD}" == true ]]; then
+            # Will fetch from 1Password later if credentials are invalid
+            MFA_TOKEN=""
+        else
+            if [[ $# -lt 1 ]]; then
+                log_error "Missing required argument: MFA_TOKEN"
+                echo ""
+                show_help
+                exit 1
+            fi
+
+            readonly MFA_TOKEN="$1"
+
+            # Validate MFA token format
+            if ! [[ "${MFA_TOKEN}" =~ ^[0-9]{6}$ ]]; then
+                log_error "Invalid MFA token format. Expected 6 digits, got: '${MFA_TOKEN}'"
+                exit 1
+            fi
+        fi
+
         log_verbose "Using profile: ${USE_PROFILE}"
-        log_verbose "MFA Token: ${MFA_TOKEN}"
         log_verbose "Account ID: ${ACCOUNT_INPUT}"
         log_verbose "Role Name: ${ROLE_NAME}"
 
@@ -901,24 +1163,45 @@ parse_arguments() {
 
     else
         # Manual mode: require MFA token, account, AND role
-        if [[ $# -lt 3 ]]; then
-            log_error "Missing required arguments"
-            log_info "Manual mode requires: <MFA_TOKEN> <ACCOUNT_ID> <ROLE_NAME>"
-            log_info "Or use profile mode: --profile <PROFILE_NAME> <MFA_TOKEN>"
-            echo ""
-            show_help
-            exit 1
-        fi
+        if [[ "${USE_1PASSWORD}" == true ]]; then
+            if [[ $# -lt 2 ]]; then
+                log_error "Missing required arguments"
+                log_info "Manual mode with 1Password requires: <ACCOUNT_ID> <ROLE_NAME>"
+                log_info "Or use profile mode: --profile <PROFILE_NAME> --use-1password <ITEM_NAME>"
+                echo ""
+                show_help
+                exit 1
+            fi
 
-        # Set variables
-        readonly MFA_TOKEN="$1"
-        readonly ACCOUNT_INPUT="$2"
-        readonly ROLE_NAME="$3"
+            log_info "Fetching MFA code from 1Password..."
+            local fetched_token
+            if ! fetched_token=$(get_mfa_from_1password "${ONEPASSWORD_ITEM}"); then
+                exit 1
+            fi
+            readonly MFA_TOKEN="${fetched_token}"
+            readonly ACCOUNT_INPUT="$1"
+            readonly ROLE_NAME="$2"
+            log_success "MFA code retrieved from 1Password"
+        else
+            if [[ $# -lt 3 ]]; then
+                log_error "Missing required arguments"
+                log_info "Manual mode requires: <MFA_TOKEN> <ACCOUNT_ID> <ROLE_NAME>"
+                log_info "Or use profile mode: --profile <PROFILE_NAME> <MFA_TOKEN>"
+                echo ""
+                show_help
+                exit 1
+            fi
 
-        # Validate MFA token format
-        if ! [[ "${MFA_TOKEN}" =~ ^[0-9]{6}$ ]]; then
-            log_error "Invalid MFA token format. Expected 6 digits, got: '${MFA_TOKEN}'"
-            exit 1
+            # Set variables
+            readonly MFA_TOKEN="$1"
+            readonly ACCOUNT_INPUT="$2"
+            readonly ROLE_NAME="$3"
+
+            # Validate MFA token format
+            if ! [[ "${MFA_TOKEN}" =~ ^[0-9]{6}$ ]]; then
+                log_error "Invalid MFA token format. Expected 6 digits, got: '${MFA_TOKEN}'"
+                exit 1
+            fi
         fi
 
         # Validate account ID format (must be 12-digit number in manual mode)
@@ -941,8 +1224,49 @@ parse_arguments() {
 main() {
     log_verbose "Starting AWS MFA role assumption script"
 
+    # ACCOUNT_INPUT is already validated as a 12-digit account ID
+    local account_id="${ACCOUNT_INPUT}"
+    log_verbose "Using account ID: ${account_id}"
+
+    # Determine the output profile name early
+    if [[ -n "${USE_PROFILE}" ]]; then
+        OUTPUT_PROFILE_NAME="temp-${USE_PROFILE}"
+    else
+        OUTPUT_PROFILE_NAME="temp-${ROLE_NAME}"
+    fi
+
+    # Check if current credentials are still valid for the target account and role (FIRST PRIORITY)
+    if check_credentials_validity "${account_id}" "${ROLE_NAME}"; then
+        # Credentials are still valid, no need to assume role again
+        log_info "Using existing valid credentials"
+        
+        # Print success message
+        echo ""
+        echo -e "${GREEN}✓ Current credentials are still valid${NC}"
+        echo ""
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}What's next?${NC}"
+        echo ""
+        echo -e "  ${GREEN}1.${NC} Set the AWS profile:"
+        echo -e "     ${YELLOW}export AWS_PROFILE=${OUTPUT_PROFILE_NAME}${NC}"
+        echo ""
+        echo -e "  ${GREEN}2.${NC} Test that it works:"
+        echo -e "     ${YELLOW}aws sts get-caller-identity${NC}"
+        echo ""
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        return 0
+    fi
+
+    # Credentials are not valid, proceed with full authentication process
+    log_info "Current credentials are not valid for target account/role, proceeding with MFA authentication"
+
     # Check dependencies
     if ! check_dependencies; then
+        exit 1
+    fi
+
+    # Fetch MFA token if using 1Password (only now that we need it)
+    if ! fetch_mfa_token_if_needed; then
         exit 1
     fi
 
@@ -952,17 +1276,13 @@ main() {
         exit 1
     fi
 
-    # ACCOUNT_INPUT is already validated as a 12-digit account ID
-    local account_id="${ACCOUNT_INPUT}"
-    log_verbose "Using account ID: ${account_id}"
-
     # Assume role with MFA
     if ! assume_role_with_mfa "${MFA_TOKEN}" "${account_id}" "${ROLE_NAME}" "${mfa_serial}"; then
         exit 1
     fi
 
     # Write credentials to AWS credentials file
-    write_credentials_to_profile || log_warn "Failed to write credentials to profile (non-fatal)"
+    write_credentials_to_profile "${OUTPUT_PROFILE_NAME}" || log_warn "Failed to write credentials to profile (non-fatal)"
 
     # Print success message with next steps
     echo ""
@@ -972,7 +1292,7 @@ main() {
     echo -e "${BLUE}What's next?${NC}"
     echo ""
     echo -e "  ${GREEN}1.${NC} Set the AWS profile:"
-    echo -e "     ${YELLOW}export AWS_PROFILE=aws-temp${NC}"
+    echo -e "     ${YELLOW}export AWS_PROFILE=${OUTPUT_PROFILE_NAME}${NC}"
     echo ""
     echo -e "  ${GREEN}2.${NC} Test that it works:"
     echo -e "     ${YELLOW}aws sts get-caller-identity${NC}"
@@ -985,7 +1305,7 @@ main() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo -e "${YELLOW}💡 Tip:${NC} Add to your shell profile for automatic activation:"
-    echo -e "   echo 'export AWS_PROFILE=aws-temp' >> ~/.bashrc"
+    echo -e "   echo 'export AWS_PROFILE=${OUTPUT_PROFILE_NAME}' >> ~/.bashrc"
     echo ""
 }
 
